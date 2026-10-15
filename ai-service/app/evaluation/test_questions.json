@@ -1,8 +1,0 @@
-[
-  {
-    "id": "sample-001",
-    "company": "RELIANCE",
-    "question": "How did revenue and net profit change over the last five fiscal years?",
-    "expected_capabilities": ["financial_data", "quant_calculation", "citations"]
-  }
-]
