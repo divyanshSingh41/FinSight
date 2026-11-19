@@ -9,6 +9,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+from collections.abc import AsyncIterator
 
 from backend.app.tools.agent_tools import FINANCIAL_TOOLS
 
@@ -393,6 +394,7 @@ def generate_report(state: ResearchState) -> dict:
         model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         temperature=0,
         api_key=api_key,
+        streaming=True
     )
 
     report_prompt = (
@@ -471,4 +473,87 @@ def run_research(question: str,ticker: str | None = None,fiscal_year: str | None
         "data_notes": [],
         "quant_results": {},
     })
-    return str(result["messages"][-1].content)
+    content = result["messages"][-1].content
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        return "\n".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and block.get("text")
+        )
+
+    return str(content)
+
+async def stream_research(
+    question: str,
+    ticker: str | None = None,
+    fiscal_year: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> AsyncIterator[dict]:
+    initial_state = {
+        "messages": [{"role": "user", "content": question}],
+        "ticker": ticker,
+        "fiscal_year": fiscal_year,
+        "start_date": start_date,
+        "end_date": end_date,
+        "filing_queries": [],
+        "needs_filings": False,
+        "needs_stock_performance": False,
+        "assumptions": [],
+        "evidence": [],
+        "market_data": None,
+        "financial_facts": [],
+        "data_notes": [],
+        "quant_results": {},
+    }
+
+    stage_names = {
+        "planner": "Planning research",
+        "retrieve_filings": "Searching company filings",
+        "data_agent": "Collecting and checking data",
+        "quant_agent": "Calculating financial metrics",
+        "research_agent": "Reviewing evidence",
+        "report_agent": "Writing the report",
+    }
+
+    async for event in research_graph.astream_events(
+        initial_state,
+        version="v2",
+    ):
+        event_name = event.get("event")
+        metadata = event.get("metadata", {})
+        graph_node = metadata.get("langgraph_node")
+
+        if event_name == "on_chain_start" and graph_node in stage_names:
+            yield {
+                "type": "status",
+                "stage": stage_names[graph_node],
+            }
+
+        elif (
+            event_name == "on_chat_model_stream"
+            and graph_node == "report_agent"
+        ):
+            content = event.get("data", {}).get("chunk")
+            content = getattr(content, "content", "")
+
+            if isinstance(content, str) and content:
+                yield {"type": "token", "text": content}
+
+            elif isinstance(content, list):
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and block.get("text")
+                    ):
+                        yield {"type": "token", "text": block["text"]}
+
+    yield {"type": "done"}
+

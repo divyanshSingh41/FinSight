@@ -1,12 +1,15 @@
 import logging
+import json
 from datetime import date
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from backend.app.agents.research_graph import run_research
+from backend.app.agents.research_graph import run_research, stream_research
 from backend.app.tools.market_data import supported_tickers
+from collections.abc import AsyncIterator
+from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -108,3 +111,46 @@ def analyze_company(request: AnalysisRequest):
             status_code=500,
             detail="Analysis failed. Check the backend logs.",
         ) from exc
+
+def sse_event(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@app.post("/api/v1/analysis/stream")
+async def analyze_company_stream(request: AnalysisRequest):
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            yield sse_event({"type": "status", "stage": "Starting research"})
+
+            async for event in stream_research(
+                question=request.question,
+                ticker=request.ticker,
+                fiscal_year=request.fiscal_year,
+                start_date=(
+                    request.start_date.isoformat()
+                    if request.start_date
+                    else None
+                ),
+                end_date=(
+                    request.end_date.isoformat()
+                    if request.end_date
+                    else None
+                ),
+            ):
+                yield sse_event(event)
+
+        except Exception:
+            logger.exception("Streaming research workflow failed")
+            yield sse_event({
+                "type": "error",
+                "message": "Analysis failed. Check the backend logs.",
+            })
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

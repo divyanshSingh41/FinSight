@@ -22,6 +22,15 @@ function appReducer(state, action) {
         ...state,
         theme: state.theme === "bright" ? "dark" : "bright",
       };
+    case "UPDATE_MESSAGE":
+      return {
+        ...state,
+        messages: state.messages.map((message) =>
+          message.id === action.id
+            ? { ...message, text: action.text }
+            : message
+        ),
+      };
     default:
       return state;
   }
@@ -48,7 +57,7 @@ const companies = [
     symbol: "RELIANCE",
     name: "Reliance Industries",
     price: "₹1,463.20",
-    change: "+0.8%",
+    change: "21.41%",
     tone: "positive",
   },
   {
@@ -210,10 +219,36 @@ function HomePage() {
   );
 }
 
+function getAnalysisFilters(question) {
+  const companies = [
+    { ticker: "RELIANCE", pattern: /\breliance(?: industries)?\b/i },
+    { ticker: "TCS", pattern: /\b(?:tcs|tata consultancy services)\b/i },
+    { ticker: "INFY", pattern: /\binfosys\b/i },
+    {
+      ticker: "HDFCBANK",
+      pattern: /\b(?:hdfc(?!\s+(?:life|amc|asset))|hdfc bank|hdfcbank)\b/i,
+    },
+    { ticker: "ICICIBANK", pattern: /\b(?:icici bank|icicibank)\b/i },
+  ];
+
+  const company = companies.find(({ pattern }) => pattern.test(question));
+  const yearMatch = question.match(
+    /\b(?:FY\s*)?(20\d{2})\s*[-–]\s*(\d{2}|20\d{2})\b/i
+  );
+
+  return {
+    ticker: company?.ticker ?? null,
+    fiscal_year: yearMatch
+      ? `${yearMatch[1]}-${yearMatch[2].slice(-2)}`
+      : null,
+  };
+}
+
 function AnalysisPage() {
   const { state, dispatch } = useApp();
   const [input, setInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
+  const [progress, setProgress] = useState("");
 
   // useEffect(() => {
   //   const controller = new AbortController();
@@ -241,44 +276,105 @@ function AnalysisPage() {
     const question = input.trim();
     if (question.length < 5 || isTyping) return;
 
+    const assistantId = crypto.randomUUID();
+
     dispatch({
       type: "ADD_MESSAGE",
       message: { role: "user", text: question },
     });
 
+    dispatch({
+      type: "ADD_MESSAGE",
+      message: { id: assistantId, role: "assistant", text: "" },
+    });
+
     setInput("");
     setIsTyping(true);
+    setProgress("Starting research");
+
+    let assistantText = "";
+
+    function updateAssistant(text) {
+      assistantText += text;
+      dispatch({
+        type: "UPDATE_MESSAGE",
+        id: assistantId,
+        text: assistantText,
+      });
+    }
 
     try {
-      const response = await fetch("http://localhost:8000/api/v1/analysis", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ question }),
-      });
-
-      const data = await response.json().catch(() => ({}));
+      const response = await fetch(
+        "http://localhost:8000/api/v1/analysis/stream",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          },
+          body: JSON.stringify({
+            question,
+            ...getAnalysisFilters(question),
+          }),
+        }
+      );
 
       if (!response.ok) {
-        throw new Error(data.detail || `Request failed (${response.status})`);
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(
+          errorData.detail || `Request failed (${response.status})`
+        );
       }
 
-      dispatch({
-        type: "ADD_MESSAGE",
-        message: { role: "assistant", text: data.report },
-      });
+      if (!response.body) {
+        throw new Error("Streaming response is not supported by this browser.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const frames = buffer.split(/\r?\n\r?\n/);
+        buffer = frames.pop() || "";
+
+        for (const frame of frames) {
+          const dataLine = frame
+            .split(/\r?\n/)
+            .find((line) => line.startsWith("data:"));
+
+          if (!dataLine) continue;
+
+          const eventData = JSON.parse(dataLine.slice(5).trim());
+
+          if (eventData.type === "status") {
+            setProgress(eventData.stage);
+          } else if (eventData.type === "token") {
+            updateAssistant(eventData.text);
+          } else if (eventData.type === "error") {
+            throw new Error(eventData.message);
+          }
+        }
+      }
+
+      if (!assistantText) {
+        updateAssistant("The analysis completed without returning report text.");
+      }
     } catch (error) {
-      console.error("Analysis request failed:", error);
+      console.error("Streaming analysis failed:", error);
 
       dispatch({
-        type: "ADD_MESSAGE",
-        message: {
-          role: "assistant",
-          text: "A server issue is occurring right now. Please try again in a little while.",
-        },
+        type: "UPDATE_MESSAGE",
+        id: assistantId,
+        text: error.message || "The analysis failed. Please try again.",
       });
     } finally {
+      setProgress("");
       setIsTyping(false);
     }
   }
@@ -329,7 +425,9 @@ function AnalysisPage() {
           )}
 
           {isTyping && (
-            <p className="typing-indicator">FinSight is researching…</p>
+            <p className="typing-indicator">
+              {progress || "FinSight is researching…"}
+            </p>
           )}
         </div>
 
